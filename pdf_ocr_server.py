@@ -140,9 +140,9 @@ async def process_page_with_ollama(page_image_bytes: bytes, page_num: int) -> st
 
             # Добавляем строку с номером страницы
             if text:
-                return f"\n\nСТРАНИЦА {page_num}\n{text}\n"
+                return f"\nСТРАНИЦА {page_num}\n{text}\n"
             else:
-                return f"\n\nСТРАНИЦА {page_num}\n[Пустая страница]\n"
+                return f"\nСТРАНИЦА {page_num}\n[Пустая страница]\n"
 
     except Exception as e:
         logger.error(f"Ошибка при обработке страницы {page_num}: {e}")
