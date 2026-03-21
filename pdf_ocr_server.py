@@ -107,7 +107,12 @@ async def process_page_with_ollama(page_image_bytes: bytes, page_num: int) -> st
         # Формируем запрос к Ollama
         payload = {
             "model": MODEL_NAME,
-            "prompt": "Извлеки весь текст с этой страницы документа. Верни только текст без комментариев.",
+            "prompt": """Извлеки весь текст с этой страницы документа. 
+Верни только текст в обычном читаемом формате, используя кириллицу для русского текста.
+Не используй Unicode escape последовательности (например, /uniXXXX).
+Не добавляй комментарии и пояснения.
+Если текст на русском языке, он должен быть в читаемой кириллице.
+Если на английском - латиницей.""",
             "images": [image_base64],
             "stream": False,
             "options": {
@@ -135,13 +140,13 @@ async def process_page_with_ollama(page_image_bytes: bytes, page_num: int) -> st
 
             # Добавляем строку с номером страницы
             if text:
-                return f"СТРАНИЦА {page_num}\n{text}\n\n"
+                return f"\n\nСТРАНИЦА {page_num}\n{text}\n"
             else:
-                return f"СТРАНИЦА {page_num}\n[Пустая страница]\n\n"
+                return f"\n\nСТРАНИЦА {page_num}\n[Пустая страница]\n"
 
     except Exception as e:
         logger.error(f"Ошибка при обработке страницы {page_num}: {e}")
-        return f"СТРАНИЦА {page_num}\n[Ошибка OCR: {str(e)}]\n\n"
+        return f"\nСТРАНИЦА {page_num}\n[Ошибка OCR: {str(e)}]\n\n"
 
 
 async def convert_pdf_page_to_image(pdf_bytes: bytes, page_num: int) -> bytes:
