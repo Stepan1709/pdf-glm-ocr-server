@@ -5,15 +5,17 @@ import os
 HOST = "0.0.0.0"  # Слушаем все интерфейсы
 PORT = 9000
 
-# Настройки VLLM с Qwen3.5-9B Vision
+# Настройки vLLM (OpenAI-compatible API)
+# Импортируем из secrets.py
 try:
-    from secrets import VLLM_URL, VLLM_API_KEY, MODEL_NAME
+    from secrets import VLLM_URL, VLLM_API_KEY
 except ImportError:
     # Значения по умолчанию, если secrets.py не найден
-    VLLM_URL = "http://localhost:8300/v1"
+    VLLM_URL = "http://localhost:8300"
     VLLM_API_KEY = " "
-    MODEL_NAME = "Qwen3.5 9B Vision"
     print(f"⚠️  Файл secrets.py не найден! Использую значения по умолчанию")
+
+MODEL_NAME = "/data/models/Qwen3.5-9B"  # Полный путь к модели
 
 # Настройки временных файлов
 TEMP_DIR = "/tmp/pdf_ocr_server"  # Директория для временных файлов

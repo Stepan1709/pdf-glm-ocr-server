@@ -8,21 +8,23 @@
 import os
 import sys
 import io
+import base64
+import json
+from datetime import datetime
+from typing import Dict, Any, Optional
 import asyncio
 import aiohttp
-from datetime import datetime
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import PlainTextResponse
 import PyPDF2
 from pdf2image import convert_from_bytes
-import fitz  # PyMuPDF
+import fitz  # PyMuPDF - для более надежной работы с PDF
 from tqdm import tqdm
 import logging
 from contextlib import asynccontextmanager
 
 # Импортируем настройки
 from config import HOST, PORT, VLLM_URL, VLLM_API_KEY, MODEL_NAME, TEMP_DIR, LOG_FILE
-from vllm_client import init_vllm_client, vllm_client
 
 # Настройка логирования
 logging.basicConfig(
@@ -43,10 +45,6 @@ session = None
 async def lifespan(app: FastAPI):
     """Управление жизненным циклом приложения"""
     global session
-
-    # Инициализируем клиент vLLM
-    init_vllm_client(VLLM_URL, VLLM_API_KEY, MODEL_NAME)
-
     # Запуск: создаем сессию
     session = aiohttp.ClientSession()
     logger.info(f"🚀 Сервер запущен на http://{HOST}:{PORT}")
@@ -96,35 +94,108 @@ def get_pdf_page_count(pdf_bytes: bytes) -> int:
 
 async def process_page_with_vllm(page_image_bytes: bytes, page_num: int) -> str:
     """
-    Отправка изображения страницы в vLLM (Qwen3.5-9B Vision) для OCR
+    Отправка изображения страницы в vLLM для OCR
     Возвращает распознанный текст
     """
     try:
-        # Промпт для OCR с акцентом на русский язык и сложную структуру
-        prompt = """Извлеки весь текст с этой страницы документа. 
-Важные требования:
-1. Сохрани оригинальную структуру документа (абзацы, списки, таблицы)
-2. Для русского текста используй читаемую кириллицу (не Unicode escape)
-3. Для английского текста используй латиницу
-4. Сохрани все важные элементы форматирования: заголовки, подзаголовки, маркированные списки
-5. Если есть таблицы, представь их в читаемом текстовом формате
-6. Не добавляй комментарии и пояснения от себя
-7. Верни только текст документа без дополнительных описаний
+        # Кодируем изображение в base64
+        image_base64 = base64.b64encode(page_image_bytes).decode('utf-8')
+        image_url = f"data:image/png;base64,{image_base64}"
 
-Текст должен быть максимально точным и сохранять смысл оригинала."""
+        # Формируем запрос к vLLM (OpenAI-compatible API)
+        payload = {
+            "model": MODEL_NAME,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": """Извлеки ВЕСЬ текст с этого изображения документа. 
+Критически важно:
+1. Сохрани оригинальную структуру текста (абзацы, списки, заголовки, колонки)
+2. Если текст на русском - выводи кириллицей, на английском - латиницей
+3. НЕ используй форматирование Markdown (кроме разделения абзацев)
+4. Верни ТОЛЬКО извлеченный текст, без каких-либо дополнительных слов
+5. Если есть таблицы - сохрани их структуру с помощью пробелов или табуляции
+6. Сохрани нумерацию страниц, если она есть на изображении
+7. Не обрезай текст - верни всё, что видишь на странице"""
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": image_url
+                            }
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 8192,  # Максимум токенов для вывода
+            "temperature": 0.1,  # Низкая температура для детерминированного извлечения текста
+            "top_p": 0.95,
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "extra_body": {
+             "chat_template_kwargs": {"enable_thinking": False}
+            }
+        }
 
-        # Используем vLLM клиент для обработки
-        text = await vllm_client.process_image(session, page_image_bytes, prompt)
+        # Заголовки для аутентификации
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {VLLM_API_KEY}"
+        }
 
-        # Добавляем строку с номером страницы
-        if text:
+        # Отправляем запрос
+        async with session.post(f"{VLLM_URL}/v1/chat/completions",
+                                json=payload,
+                                headers=headers) as response:
+
+            if response.status != 200:
+                error_text = await response.text()
+                raise Exception(f"vLLM вернул ошибку {response.status}: {error_text}")
+
+            result = await response.json()
+
+            # Извлекаем текст из ответа
+            text = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+
+            # Проверяем, не содержит ли ответ "thinking process"
+            if "Thinking Process:" in text or "<think>" in text:
+                # Если модель добавила мышление, пытаемся извлечь только финальный ответ
+                if "<think>" in text and "</think>" in text:
+                    # Извлекаем текст после </think>
+                    text = text.split("</think>")[-1].strip()
+                elif "Thinking Process:" in text:
+                    # Ищем последний абзац после рассуждений
+                    lines = text.split("\n")
+                    # Пропускаем строки, похожие на рассуждения
+                    cleaned_lines = []
+                    skip_until = False
+                    for line in lines:
+                        if "Thinking Process:" in line or "<think>" in line:
+                            skip_until = True
+                            continue
+                        if "</think>" in line:
+                            skip_until = False
+                            continue
+                        if not skip_until and line.strip() and not line.strip().startswith(("1.", "2.", "3.", "-")):
+                            cleaned_lines.append(line)
+                    text = "\n".join(cleaned_lines).strip()
+
+            # Если текст всё еще пустой или содержит только мусор
+            if not text or len(text) < 10:
+                logger.warning(f"Страница {page_num}: получен пустой или слишком короткий текст")
+                return f"\nСТРАНИЦА {page_num}\n[Пустая страница или не удалось распознать текст]\n"
+
+            logger.info(f"Страница {page_num}: распознано {len(text)} символов")
+
+            # Добавляем строку с номером страницы
             return f"\nСТРАНИЦА {page_num}\n{text}\n"
-        else:
-            return f"\nСТРАНИЦА {page_num}\n[Пустая страница]\n"
 
     except Exception as e:
         logger.error(f"Ошибка при обработке страницы {page_num}: {e}")
-        return f"\nСТРАНИЦА {page_num}\n[Ошибка OCR: {str(e)}]\n\n"
+        return f"\nСТРАНИЦА {page_num}\n[Ошибка OCR: {str(e)}]\n"
 
 
 async def convert_pdf_page_to_image(pdf_bytes: bytes, page_num: int) -> bytes:
@@ -147,7 +218,7 @@ async def convert_pdf_page_to_image(pdf_bytes: bytes, page_num: int) -> bytes:
 
         # Конвертируем изображение в байты
         img_byte_arr = io.BytesIO()
-        images[0].save(img_byte_arr, format='PNG', optimize=True)
+        images[0].save(img_byte_arr, format='PNG', optimize=False)
         img_byte_arr.seek(0)
 
         return img_byte_arr.getvalue()
@@ -184,10 +255,13 @@ async def process_pdf(filename: str, pdf_bytes: bytes) -> str:
                 pbar.update(1)
                 pbar.set_postfix({"Текущая страница": page_num})
 
+                # Небольшая задержка между запросами, чтобы не перегружать vLLM
+                await asyncio.sleep(0.1)
+
             except Exception as e:
                 error_msg = f"Ошибка при обработке страницы {page_num}: {str(e)}"
                 logger.error(error_msg)
-                all_text.append(f"\nСТРАНИЦА {page_num}\n[Ошибка: {str(e)}]\n\n")
+                all_text.append(f"\nСТРАНИЦА {page_num}\n[Ошибка: {str(e)}]\n")
                 pbar.update(1)
                 continue
 
@@ -252,25 +326,27 @@ async def health_check():
     """Проверка работоспособности сервера"""
     # Проверяем доступность vLLM
     try:
-        async with session.get(f"{VLLM_URL}/models", headers={"Authorization": f"Bearer {VLLM_API_KEY}"}) as response:
+        headers = {"Authorization": f"Bearer {VLLM_API_KEY}"}
+        async with session.get(f"{VLLM_URL}/v1/models", headers=headers) as response:
             if response.status == 200:
-                models_data = await response.json()
-                model_available = any(MODEL_NAME in m.get("id", "") for m in models_data.get("data", []))
+                models = await response.json()
+                model_available = any(MODEL_NAME in m.get("id", "") for m in models.get("data", []))
                 return {
                     "status": "healthy",
                     "vllm": "connected",
-                    "model_available": model_available,
-                    "model": MODEL_NAME
+                    "model_available": model_available
+                }
+            else:
+                return {
+                    "status": "degraded",
+                    "vllm": f"error_{response.status}"
                 }
     except Exception as e:
-        logger.warning(f"Health check failed: {e}")
         return {
             "status": "degraded",
             "vllm": "disconnected",
             "error": str(e)
         }
-
-    return {"status": "healthy", "vllm": "connected"}
 
 
 @app.get("/")
