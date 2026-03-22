@@ -1,32 +1,28 @@
 #!/usr/bin/env python3
 """
-Сервер для обработки PDF через OCR модель GLM-OCR
-Принимает файлы по API, разбивает на страницы, отправляет в Ollama,
+Сервер для обработки PDF через OCR модель Qwen3.5-9B Vision
+Принимает файлы по API, разбивает на страницы, отправляет в vLLM,
 возвращает текст с нумерацией страниц.
 """
 
 import os
 import sys
 import io
-import shutil
-import tempfile
-from datetime import datetime
-from pathlib import Path
-from typing import Dict, Any
 import asyncio
 import aiohttp
-import aiofiles
+from datetime import datetime
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import PlainTextResponse
 import PyPDF2
 from pdf2image import convert_from_bytes
-import fitz  # PyMuPDF - для более надежной работы с PDF
+import fitz  # PyMuPDF
 from tqdm import tqdm
 import logging
 from contextlib import asynccontextmanager
 
 # Импортируем настройки
-from config import HOST, PORT, OLLAMA_URL, MODEL_NAME, TEMP_DIR, LOG_FILE
+from config import HOST, PORT, VLLM_URL, VLLM_API_KEY, MODEL_NAME, TEMP_DIR, LOG_FILE
+from vllm_client import init_vllm_client, vllm_client
 
 # Настройка логирования
 logging.basicConfig(
@@ -47,10 +43,14 @@ session = None
 async def lifespan(app: FastAPI):
     """Управление жизненным циклом приложения"""
     global session
+
+    # Инициализируем клиент vLLM
+    init_vllm_client(VLLM_URL, VLLM_API_KEY, MODEL_NAME)
+
     # Запуск: создаем сессию
     session = aiohttp.ClientSession()
     logger.info(f"🚀 Сервер запущен на http://{HOST}:{PORT}")
-    logger.info(f"📡 Подключен к Ollama: {OLLAMA_URL}")
+    logger.info(f"📡 Подключен к vLLM: {VLLM_URL}")
     logger.info(f"🤖 Модель: {MODEL_NAME}")
 
     yield
@@ -64,8 +64,8 @@ async def lifespan(app: FastAPI):
 # Создаем приложение FastAPI
 app = FastAPI(
     title="PDF OCR Server",
-    description="Сервер для OCR обработки PDF с помощью GLM-OCR",
-    version="1.0.0",
+    description="Сервер для OCR обработки PDF с помощью Qwen3.5-9B Vision",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -94,55 +94,33 @@ def get_pdf_page_count(pdf_bytes: bytes) -> int:
         return pdf_document.page_count
 
 
-async def process_page_with_ollama(page_image_bytes: bytes, page_num: int) -> str:
+async def process_page_with_vllm(page_image_bytes: bytes, page_num: int) -> str:
     """
-    Отправка изображения страницы в Ollama для OCR
+    Отправка изображения страницы в vLLM (Qwen3.5-9B Vision) для OCR
     Возвращает распознанный текст
     """
     try:
-        # Кодируем изображение в base64
-        import base64
-        image_base64 = base64.b64encode(page_image_bytes).decode('utf-8')
+        # Промпт для OCR с акцентом на русский язык и сложную структуру
+        prompt = """Извлеки весь текст с этой страницы документа. 
+Важные требования:
+1. Сохрани оригинальную структуру документа (абзацы, списки, таблицы)
+2. Для русского текста используй читаемую кириллицу (не Unicode escape)
+3. Для английского текста используй латиницу
+4. Сохрани все важные элементы форматирования: заголовки, подзаголовки, маркированные списки
+5. Если есть таблицы, представь их в читаемом текстовом формате
+6. Не добавляй комментарии и пояснения от себя
+7. Верни только текст документа без дополнительных описаний
 
-        # Формируем запрос к Ollama
-        payload = {
-            "model": MODEL_NAME,
-            "prompt": """Извлеки весь текст с этой страницы документа. 
-Верни только текст в обычном читаемом формате, используя кириллицу для русского текста.
-Не используй Unicode escape последовательности (например, /uniXXXX).
-Не добавляй комментарии и пояснения.
-Если текст на русском языке, он должен быть в читаемой кириллице.
-Если на английском - латиницей.""",
-            "images": [image_base64],
-            "stream": False,
-            "options": {
-                "temperature": 0.1,
-                "top_p": 0.9,
-                # Параметры для управления ресурсами
-                "num_ctx": 2048,  # Размер контекста (токенов)
-                "num_predict": 4096,  # Максимум токенов для генерации
-                #"num_thread": 8,  # Количество потоков CPU
-                #"num_gpu": 24,  # Количество слоев модели на GPU (24 слоя для полной загрузки)
-                #"main_gpu": 0,  # Основной GPU (индекс 0)
-                #"tensor_split": [0.5, 0.5],  # Распределение тензоров между GPU (если несколько)
-                "seed": 42,  # Фиксированный seed для воспроизводимости
-            }
-        }
+Текст должен быть максимально точным и сохранять смысл оригинала."""
 
-        # Отправляем запрос
-        async with session.post(f"{OLLAMA_URL}/api/generate", json=payload) as response:
-            if response.status != 200:
-                error_text = await response.text()
-                raise Exception(f"Ollama вернул ошибку {response.status}: {error_text}")
+        # Используем vLLM клиент для обработки
+        text = await vllm_client.process_image(session, page_image_bytes, prompt)
 
-            result = await response.json()
-            text = result.get("response", "").strip()
-
-            # Добавляем строку с номером страницы
-            if text:
-                return f"\nСТРАНИЦА {page_num}\n{text}\n"
-            else:
-                return f"\nСТРАНИЦА {page_num}\n[Пустая страница]\n"
+        # Добавляем строку с номером страницы
+        if text:
+            return f"\nСТРАНИЦА {page_num}\n{text}\n"
+        else:
+            return f"\nСТРАНИЦА {page_num}\n[Пустая страница]\n"
 
     except Exception as e:
         logger.error(f"Ошибка при обработке страницы {page_num}: {e}")
@@ -169,7 +147,7 @@ async def convert_pdf_page_to_image(pdf_bytes: bytes, page_num: int) -> bytes:
 
         # Конвертируем изображение в байты
         img_byte_arr = io.BytesIO()
-        images[0].save(img_byte_arr, format='PNG')
+        images[0].save(img_byte_arr, format='PNG', optimize=True)
         img_byte_arr.seek(0)
 
         return img_byte_arr.getvalue()
@@ -182,7 +160,7 @@ async def convert_pdf_page_to_image(pdf_bytes: bytes, page_num: int) -> bytes:
 async def process_pdf(filename: str, pdf_bytes: bytes) -> str:
     """
     Основная функция обработки PDF
-    Разбивает на страницы, отправляет в Ollama, собирает результат
+    Разбивает на страницы, отправляет в vLLM, собирает результат
     """
     # Получаем количество страниц
     total_pages = get_pdf_page_count(pdf_bytes)
@@ -198,8 +176,8 @@ async def process_pdf(filename: str, pdf_bytes: bytes) -> str:
                 # Конвертируем страницу в изображение
                 page_image = await convert_pdf_page_to_image(pdf_bytes, page_num)
 
-                # Отправляем в Ollama
-                page_text = await process_page_with_ollama(page_image, page_num)
+                # Отправляем в vLLM
+                page_text = await process_page_with_vllm(page_image, page_num)
                 all_text.append(page_text)
 
                 # Обновляем прогресс-бар
@@ -209,7 +187,7 @@ async def process_pdf(filename: str, pdf_bytes: bytes) -> str:
             except Exception as e:
                 error_msg = f"Ошибка при обработке страницы {page_num}: {str(e)}"
                 logger.error(error_msg)
-                all_text.append(f"СТРАНИЦА {page_num}\n[Ошибка: {str(e)}]\n\n")
+                all_text.append(f"\nСТРАНИЦА {page_num}\n[Ошибка: {str(e)}]\n\n")
                 pbar.update(1)
                 continue
 
@@ -272,25 +250,27 @@ async def ocr_pdf(file: UploadFile = File(...)) -> str:
 @app.get("/health")
 async def health_check():
     """Проверка работоспособности сервера"""
-    # Проверяем доступность Ollama
+    # Проверяем доступность vLLM
     try:
-        async with session.get(f"{OLLAMA_URL}/api/tags") as response:
+        async with session.get(f"{VLLM_URL}/models", headers={"Authorization": f"Bearer {VLLM_API_KEY}"}) as response:
             if response.status == 200:
-                models = await response.json()
-                model_available = any(m.get("name", "").startswith(MODEL_NAME.split(":")[0])
-                                      for m in models.get("models", []))
+                models_data = await response.json()
+                model_available = any(MODEL_NAME in m.get("id", "") for m in models_data.get("data", []))
                 return {
                     "status": "healthy",
-                    "ollama": "connected",
-                    "model_available": model_available
+                    "vllm": "connected",
+                    "model_available": model_available,
+                    "model": MODEL_NAME
                 }
-    except:
+    except Exception as e:
+        logger.warning(f"Health check failed: {e}")
         return {
             "status": "degraded",
-            "ollama": "disconnected"
+            "vllm": "disconnected",
+            "error": str(e)
         }
 
-    return {"status": "healthy", "ollama": "connected"}
+    return {"status": "healthy", "vllm": "connected"}
 
 
 @app.get("/")
@@ -298,13 +278,13 @@ async def root():
     """Корневой эндпоинт с информацией о сервере"""
     return {
         "service": "PDF OCR Server",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "endpoints": {
             "ocr": "POST /ocr - Отправить PDF файл для OCR",
             "health": "GET /health - Проверка состояния сервера"
         },
         "model": MODEL_NAME,
-        "ollama_url": OLLAMA_URL
+        "vllm_url": VLLM_URL
     }
 
 
